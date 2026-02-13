@@ -7,7 +7,7 @@ from datetime import date
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Gestion Expert Congés", page_icon="🗓️", layout="wide")
 
-# --- CSS PERSONALISÉ ---
+# --- CSS PERSONNALISÉ ---
 st.markdown("""
 <style>
     .stMetric { background-color: #f0f2f6; padding: 10px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
@@ -64,29 +64,40 @@ def calculer_jours_ouvres(start, end, feries_list):
             count += 1
     return count, details
 
-def recalculer_droits_frac(df_conges, annee_ref):
-    """Calcul automatique des droits FRAC selon règles légales"""
+def recalculer_droits_frac_robuste(df_conges, annee_ref):
+    """
+    Calcul automatique des droits FRAC (Correction V3.1)
+    Gère robuste les formats de dates hétérogènes.
+    """
     if df_conges.empty: return 0, 0
     
     jours_hors_periode = 0
-    debut_ete = pd.to_datetime(datetime.date(annee_ref, 5, 1))
-    fin_ete = pd.to_datetime(datetime.date(annee_ref, 10, 31))
+    
+    # On force tout en Timestamp Pandas pour comparer des pommes avec des pommes
+    debut_ete = pd.Timestamp(year=annee_ref, month=5, day=1)
+    fin_ete = pd.Timestamp(year=annee_ref, month=10, day=31)
 
-    # On ne regarde que les lignes "CA"
-    ca_rows = df_conges[df_conges['Type'] == 'CA']
+    # Filtrer uniquement les CA
+    if 'Type' in df_conges.columns:
+        ca_rows = df_conges[df_conges['Type'] == 'CA']
+    else:
+        return 0, 0
     
     for _, row in ca_rows.iterrows():
-        # Conversion sécurisée
-        d_start = pd.to_datetime(row['Début'])
-        d_end = pd.to_datetime(row['Fin'])
-        current_range = pd.date_range(d_start, d_end)
-        
-        for jour in current_range:
-            # On recompte grossièrement les jours hors période (simplifié pour l'exemple)
-            # Dans l'idéal il faudrait re-vérifier si c'est un jour ouvré, 
-            # mais on suppose que les jours stockés sont validés.
-            if jour < debut_ete or jour > fin_ete:
-                jours_hors_periode += 1
+        # Conversion sécurisée en Timestamp
+        try:
+            d_start = pd.to_datetime(row['Début'])
+            d_end = pd.to_datetime(row['Fin'])
+            
+            # Générer la plage
+            current_range = pd.date_range(d_start, d_end)
+            
+            for jour in current_range:
+                # Vérification purement calendaire (hors 1er Mai - 31 Oct)
+                if jour < debut_ete or jour > fin_ete:
+                    jours_hors_periode += 1
+        except:
+            continue # Si erreur de date sur une ligne, on passe
     
     bonus = 0
     if jours_hors_periode >= 8: bonus = 2
@@ -97,7 +108,6 @@ def recalculer_droits_frac(df_conges, annee_ref):
 # --- 2. INITIALISATION ---
 
 if 'conges' not in st.session_state:
-    # Structure de données initiale (liste de dictionnaires)
     st.session_state.conges = []
 
 st.title("🏗️ Gestionnaire Expert Congés")
@@ -133,13 +143,10 @@ with st.container():
     with col3:
         new_end = st.date_input("Au", value=date.today(), min_value=limit_min, max_value=limit_max, format="DD/MM/YYYY")
 
-    # >>> CALCUL DYNAMIQUE ICI <<<
-    # Se lance à chaque changement de date, avant le clic bouton
+    # >>> CALCUL DYNAMIQUE <<<
     jours_calc = 0
     if new_end >= new_start:
         jours_calc, details_calc = calculer_jours_ouvres(new_start, new_end, feries)
-        
-        # Affichage du résultat prédictif
         if jours_calc > 0:
             st.info(f"⏱️ **Simulation : {jours_calc} jours** seront décomptés.")
         else:
@@ -147,45 +154,98 @@ with st.container():
     else:
         st.error("Date de fin incorrecte.")
 
-    # Bouton de validation
     with col4:
-        st.write("") # Espacement vertical
+        st.write("") 
         st.write("")
         if st.button("Valider ✅", type="primary", disabled=(jours_calc==0)):
-            # Ajout au state
             st.session_state.conges.append({
                 "Type": new_type,
-                "Début": new_start, # On garde l'objet date pour le calcul
+                "Début": new_start,
                 "Fin": new_end,
                 "Jours": jours_calc,
-                "Commentaire": "" # Champ bonus pour l'éditeur
             })
             st.rerun()
 
 st.divider()
 
-# --- 5. TABLEAU INTERACTIF (MODIFICATION / SUPPRESSION) ---
+# --- 5. TABLEAU INTERACTIF (HISTORIQUE) ---
 st.subheader("2. Historique & Modifications")
-st.caption("Sélectionnez une ligne et appuyez sur 'Suppr' (ou l'icône corbeille) pour l'effacer.")
+st.caption("Sélectionnez une ligne et appuyez sur 'Suppr' (ou la corbeille) pour l'effacer.")
+
+edited_df = pd.DataFrame() # Valeur par défaut
 
 if len(st.session_state.conges) > 0:
-    # Création DataFrame
     df_current = pd.DataFrame(st.session_state.conges)
     
     # Configuration de l'éditeur
     edited_df = st.data_editor(
         df_current,
-        num_rows="dynamic", # Permet ajout/suppression
+        num_rows="dynamic",
         use_container_width=True,
-        key="data_editor",
+        key="editor_conges",
         column_config={
             "Début": st.column_config.DateColumn("Début", format="DD/MM/YYYY"),
             "Fin": st.column_config.DateColumn("Fin", format="DD/MM/YYYY"),
-            "Jours": st.column_config.NumberColumn("Jours", disabled=True), # On empêche de tricher sur le nb calculé
+            "Jours": st.column_config.NumberColumn("Jours", disabled=True),
             "Type": st.column_config.SelectboxColumn("Type", options=["CA", "RTT", "RC", "CET", "RTTI", "FRAC"])
         }
     )
     
-    # MISE À JOUR DU STATE EN TEMPS RÉEL
-    # Si l'utilisateur a supprimé une ligne dans l'éditeur, on met à jour la variable globale
-    # Note : data_editor renvoie le DF modifié.
+    # Synchronisation State <-> Éditeur
+    # Si le dataframe édité est différent du state actuel, on met à jour
+    if not edited_df.equals(df_current):
+        # On nettoie les dates pour éviter les bugs de format
+        try:
+            edited_df['Début'] = pd.to_datetime(edited_df['Début']).dt.date
+            edited_df['Fin'] = pd.to_datetime(edited_df['Fin']).dt.date
+            st.session_state.conges = edited_df.to_dict('records')
+            st.rerun()
+        except Exception as e:
+            st.warning("Erreur de format de date lors de l'édition.")
+
+else:
+    st.info("Aucun congé posé.")
+
+# --- 6. TABLEAU DE BORD (COMPTEURS) ---
+st.divider()
+st.subheader("3. Synthèse des Droits")
+
+# Calculs totaux sur la base de edited_df (le visuel actuel)
+if edited_df.empty and len(st.session_state.conges) > 0:
+     edited_df = pd.DataFrame(st.session_state.conges)
+
+pris = {"CA": 0, "RTT": 0, "RC": 0, "CET": 0, "RTTI": 0, "FRAC": 0}
+bonus_frac = 0
+jours_hors = 0
+
+if not edited_df.empty:
+    # Somme par type
+    gb = edited_df.groupby("Type")["Jours"].sum()
+    for t in pris:
+        if t in gb: pris[t] = gb[t]
+    
+    # Calcul FRAC corrigé
+    bonus_frac, jours_hors = recalculer_droits_frac_robuste(edited_df, annee_ref)
+
+# Affichage Cartes
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+
+def show_metric(col, label, total, consomme, color):
+    reste = total - consomme
+    col.metric(label, f"{reste}", delta=f"Pris: {consomme}", delta_color="inverse")
+
+show_metric(c1, "CA", d_ca, pris["CA"], "blue")
+show_metric(c2, "RTT", d_rtt, pris["RTT"], "purple")
+show_metric(c3, "RC", d_rc, pris["RC"], "orange")
+
+# FRAC : Total = Droits acquis (bonus) - Pris
+show_metric(c4, "FRAC", bonus_frac, pris["FRAC"], "green")
+
+show_metric(c5, "CET", d_cet, pris["CET"], "gray")
+show_metric(c6, "RTTI", d_rtti, pris["RTTI"], "red")
+
+# Explication FRAC
+if bonus_frac > 0:
+    st.success(f"✅ Bonus FRAC : **+{bonus_frac} jours** acquis (Base : {jours_hors} jours CA posés hors période).")
+elif jours_hors > 0:
+    st.caption(f"ℹ️ Compteur FRAC : {jours_hors} jours CA hors période (Seuil à 5 jours pour +1).")
